@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Word Clash
 
 A real-time multiplayer word guessing game for 2–6 players. Players create or join a room with a six-character code, solve five timed word rounds, chat, and compete on a live leaderboard.
@@ -57,3 +58,6 @@ The client first sends `create_room` or `join_room` with `{name, player_id, room
 - Configure `VITE_WS_URL` to the deployed `wss://.../ws` endpoint for production.
 - Restrict CORS origins and add rate limits / moderation before opening a public instance.
 - The current demo uses a curated word bank and no account system by design.
+=======
+# Word-Clash
+>>>>>>> 46bc81942ab511ddef1f91845f2ac6cbb92ad114
