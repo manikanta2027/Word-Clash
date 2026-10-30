@@ -1,6 +1,16 @@
-
-dist/
-
+# Python
+venv/
 __pycache__/
 *.pyc
-.env.local
+.env
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Vite
+frontend/.vite/
+
+# IDE
+.vscode/
