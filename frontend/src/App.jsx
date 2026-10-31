@@ -1,5 +1,6 @@
 
 import React from 'react';
+
 import {
   useCallback,
   useEffect,
@@ -17,7 +18,6 @@ import {
   LogIn,
   MessageCircle,
   Play,
-  RotateCcw,
   Send,
   Shield,
   Sparkles,
@@ -58,6 +58,8 @@ export default function App() {
   const [muted, setMuted] = useState(false);
   const [seconds, setSeconds] = useState(45);
   const [copied, setCopied] = useState(false);
+  const [matchmakingStatus, setMatchmakingStatus] = useState('');
+  const matchedRef = useRef(false);
 
   const ws = useRef(null);
   const chatEnd = useRef(null);
@@ -85,6 +87,19 @@ export default function App() {
     }
 
     const handlePopState = (event) => {
+      // Do not allow browser Back to reopen an earlier round/screen
+      // while a round is active or its result is being shown.
+      const currentGameStatus = stateRef.current?.status;
+      if (currentGameStatus === 'round' || currentGameStatus === 'round_result') {
+        const currentScreen = screenRef.current;
+        window.history.pushState(
+          { wordClash: true, screen: currentScreen },
+          '',
+          makeEntry(currentScreen)
+        );
+        return;
+      }
+
       if (event.state?.wordClash) {
         const destination = event.state.screen || 'home';
         const previous = screenRef.current;
@@ -186,6 +201,7 @@ export default function App() {
 
   // Connect to multiplayer server
   const connect = useCallback((action, code = '') => {
+    matchedRef.current = false;
     setError('');
 
     const socket = new WebSocket(API);
@@ -208,9 +224,22 @@ export default function App() {
       const msg = JSON.parse(e.data);
 
       if (msg.event === 'welcome') {
+        matchedRef.current = true;
         setConnected(true);
+        setMatchmakingStatus('');
         setScreen('lobby');
         setRoomCode(msg.data.room_code);
+      }
+
+      else if (msg.event === 'matchmaking') {
+        if (msg.data.status === 'cancelled') {
+          matchedRef.current = false;
+          setMatchmakingStatus('');
+          setScreen('home');
+        } else if (!matchedRef.current) {
+          setMatchmakingStatus(msg.data.message || 'Looking for another player...');
+          setScreen('matchmaking');
+        }
       }
 
       else if (msg.event === 'state') {
@@ -232,6 +261,7 @@ export default function App() {
 
       else if (msg.event === 'error') {
         setError(msg.data.message);
+        setMatchmakingStatus('');
         setScreen('home');
       }
 
@@ -342,6 +372,32 @@ export default function App() {
     );
   };
 
+  const quickMatch = () => {
+    if (!name.trim()) {
+      setError('Enter your name first.');
+      return;
+    }
+
+    setError('');
+    setMatchmakingStatus('Looking for another player...');
+    setScreen('matchmaking');
+    connect('quick_match');
+  };
+
+  const cancelMatchmaking = () => {
+    if (ws.current?.readyState === WebSocket.OPEN) {
+      ws.current.send(JSON.stringify({
+        event: 'cancel_matchmaking',
+        data: {}
+      }));
+    }
+    ws.current?.close();
+    ws.current = null;
+    setConnected(false);
+    setMatchmakingStatus('');
+    setScreen('home');
+  };
+
   const me = state?.players?.find(
     p => p.id === playerId
   );
@@ -400,9 +456,11 @@ export default function App() {
             screen === 'home' ? null : disconnect()
           }
         >
-          <span className="brand-mark">
-            <Sparkles size={19} />
-          </span>
+          <img
+           src="/favicon_1.png"
+           alt="WordClash logo"
+           className="brand-logo"
+          />
 
           <span>
             WORD<span className="brand-accent">CLASH</span>
@@ -512,6 +570,15 @@ export default function App() {
                 </div>
               </div>
 
+              <button
+                className="secondary-btn quick-match-btn"
+                onClick={quickMatch}
+              >
+                <Wifi size={18} />
+                Quick Match
+                <span>Find a random opponent</span>
+              </button>
+
               {error && (
                 <div className="error-msg">
                   <X size={15} />
@@ -520,7 +587,7 @@ export default function App() {
               )}
 
               <div className="hero-meta">
-                <span><Users size={15} /> 2–6 players</span>
+                <span><Users size={15} /> 2 players</span>
                 <span><Wifi size={15} /> Live multiplayer</span>
                 <span><Trophy size={15} /> 3–15 rounds</span>
               </div>
@@ -636,6 +703,22 @@ export default function App() {
 
         {/* LOBBY */}
 
+        {screen === 'matchmaking' && (
+          <section className="panel lobby-panel matchmaking-panel">
+            <div className="eyebrow"><span className="pulse-dot" /> QUICK MATCH</div>
+            <h2>Finding your <span>opponent.</span></h2>
+            <p>{matchmakingStatus || 'Looking for another player...'}</p>
+            <div className="eyebrow">SEARCHING FOR AN AVAILABLE PLAYER...</div>
+            <p className="host-note">
+              Keep this window open. We will start a match as soon as another player joins.
+            </p>
+            <button className="secondary-btn" onClick={cancelMatchmaking}>
+              <X size={17} />
+              Cancel search
+            </button>
+          </section>
+        )}
+
         {screen === 'lobby' && state && (
           <section className="panel lobby-panel">
 
@@ -667,7 +750,7 @@ export default function App() {
 
                 <div className="section-title">
                   <span>
-                    PLAYERS <b>{sorted.length}/6</b>
+                    PLAYERS <b>{sorted.length}/2</b>
                   </span>
 
                   <span className="live-text">
@@ -858,6 +941,7 @@ export default function App() {
                 <div>
                   <div className="eyebrow">
                     WORD CLASH · ROUND {state.round_number} OF {state.total_rounds}
+                    {' · '}{state.difficulty || 'Easy'} · {state.question_points ?? 100} MARKS
                   </div>
 
                   <h2>
@@ -892,11 +976,12 @@ export default function App() {
 
                   <span className="hint-count">
                     CLUE {state.revealed_hints} / 4
+                    {' · '}{state.extra_hints_used || 0} EXTRA USED
                   </span>
                 </div>
 
                 <div className="masked-word">
-                  {state.masked_word?.split('').map((c, i) => (
+                  {Array.from((state.masked_word || '').replace(/\s+/g, '')).map((c, i) => (
                     <span key={i}>{c}</span>
                   ))}
                 </div>
@@ -920,7 +1005,9 @@ export default function App() {
                     Reveal next clue
                   </button>
 
-                  <span>Clues are shared with everyone</span>
+                  <span>
+                    First 2 clues are free for everyone. Extra clues are private and reduce your score.
+                  </span>
                 </div>
 
               </div>
@@ -933,11 +1020,25 @@ export default function App() {
                 }}
               >
                 <input
+                  type="text"
                   value={guess}
-                  onChange={e => setGuess(e.target.value)}
+                  onChange={e => {
+                    setGuess(e.target.value);
+                    setFeedback(null);
+                  }}
+                  onPaste={e => e.preventDefault()}
+                  onDrop={e => e.preventDefault()}
+                  onContextMenu={e => e.preventDefault()}
+                  onKeyDown={e => {
+                    if ((e.ctrlKey || e.metaKey) && ['v', 'x'].includes(e.key.toLowerCase())) {
+                      e.preventDefault();
+                    }
+                  }}
                   placeholder="Type your answer..."
                   maxLength={40}
                   autoComplete="off"
+                  autoCorrect="off"
+                  spellCheck={false}
                 />
 
                 <button className="primary-btn" type="submit">
@@ -1033,6 +1134,11 @@ export default function App() {
               {state.round_results?.category}
             </p>
 
+            <p className="result-category">
+              Difficulty: {state.round_results?.difficulty || state.difficulty || 'Easy'}
+              {' · '}Question value: {state.round_results?.question_points ?? state.question_points ?? 100} marks
+            </p>
+
             <div className="result-scores">
               {(state.round_results?.scores || sorted).map((p, i) => (
                 <div className="result-score-row" key={p.id}>
@@ -1043,21 +1149,11 @@ export default function App() {
               ))}
             </div>
 
-            {isHost ? (
-              <button
-                className="primary-btn"
-                onClick={() => send('next_round')}
-              >
-                {state.round_number >= state.total_rounds
-                  ? 'See final results'
-                  : 'Next round'}
-                <ArrowRight size={17} />
-              </button>
-            ) : (
-              <p className="host-note">
-                Waiting for the host to continue...
-              </p>
-            )}
+            <p className="host-note">
+              {state.round_number >= state.total_rounds
+                ? 'Final results will appear automatically in 2 seconds...'
+                : 'Next question starts automatically in 2 seconds...'}
+            </p>
 
           </section>
         )}
@@ -1076,9 +1172,12 @@ export default function App() {
             </div>
 
             <h2>
-              We have a <span>winner.</span>
+              {state.winner
+                ? <>We have a <span>winner.</span></>
+                : <><span>It's a draw!</span></>}
             </h2>
 
+            {state.winner ? (
             <div className="winner-card">
               <div className="winner-avatar">
                 <Crown size={25} />
@@ -1093,6 +1192,11 @@ export default function App() {
                 <small> POINTS</small>
               </strong>
             </div>
+            ) : (
+              <p className="result-category">
+                No winner this time. The match ended in a tie.
+              </p>
+            )}
 
             <div className="result-scores">
               {sorted.map((p, i) => (
@@ -1103,20 +1207,6 @@ export default function App() {
                 </div>
               ))}
             </div>
-
-            <button
-              className="primary-btn"
-              onClick={() => send('rematch_vote')}
-            >
-              <RotateCcw size={17} />
-              Vote for rematch
-              <ArrowRight size={17} />
-            </button>
-
-            <p className="host-note">
-              Rematch votes: {state.rematch_votes?.length || 0}
-              {' '}· Majority starts a fresh game.
-            </p>
 
             <button
               className="text-btn"

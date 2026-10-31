@@ -1,9 +1,14 @@
 from __future__ import annotations
-import asyncio, json, random, re, string, time
+import asyncio, json, os, random, re, string, time
 from dataclasses import dataclass, field
 from typing import Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+
+load_dotenv()
 
 app = FastAPI(title="Word Clash API", version="1.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -52,7 +57,119 @@ class Room:
     rematch_votes: set[str] = field(default_factory=set)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
+
 rooms: dict[str, Room] = {}
+
+# Quick Match queue: each waiting connection owns a Future that resolves
+# when another player is paired with it.
+matchmaking_waiters: dict[str, dict[str, Any]] = {}
+matchmaking_lock = asyncio.Lock()
+
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+
+def difficulty_for_round(round_number: int, total_rounds: int) -> tuple[str, int]:
+    """Increase difficulty from Easy to Medium to Hard across the match."""
+    total = max(1, total_rounds)
+    progress_index = max(0, round_number - 1)
+    tier = min(2, (progress_index * 3) // total)
+    return [("Easy", 100), ("Medium", 150), ("Hard", 200)][tier]
+
+
+
+
+def _generate_word_with_gemini(used_words: set[str], difficulty: str = "Easy") -> dict[str, Any] | None:
+    """Generate one fresh Word Clash answer and four progressive hints."""
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        return None
+
+    client = genai.Client(api_key=api_key)
+    prompt = f"""
+Create exactly one original word-guessing round for a multiplayer game.
+Difficulty for this question: {difficulty}. Match the answer complexity to this level: Easy uses very common words; Medium uses familiar but less obvious words; Hard uses challenging but still fair general-knowledge words.
+Return ONLY valid JSON with this exact shape:
+{{
+  "word": "ONE WORD OR A COMMON COMPOUND WORD",
+  "category": "one short category",
+  "hints": [
+    "Hint 1: difficult and indirect",
+    "Hint 2: a little more helpful",
+    "Hint 3: quite helpful",
+    "Hint 4: very helpful but do not say the answer"
+  ]
+}}
+
+Rules:
+- Choose a very familiar, everyday answer that most people can guess.
+- Prefer common things, animals, foods, sports, places, school items,
+  household objects, popular technology, and simple nature words.
+- Use simple English that a school student can understand. Keep each hint
+  short, friendly, and conversational. Avoid difficult vocabulary, riddles,
+  wordplay, technical terms, and confusing descriptions.
+- Make all four hints useful and fairly easy, becoming more direct each time.
+  Hint 1 should already give a helpful clue; Hint 4 should make the answer
+  quite easy to identify without saying the answer.
+- Give concrete clues about what it looks like, where it is found, what it
+  does, or how people use it.
+- Never include the answer itself or its spelling in a hint.
+- Avoid obscure, offensive, adult, political, or highly subjective answers.
+- Do not use these previously used answers:
+{json.dumps(sorted(used_words))}
+"""
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.9,
+            ),
+        )
+        result = json.loads(response.text or "{}")
+        word = re.sub(r"[^A-Z]", "", str(result.get("word", "")).upper())
+        category = str(result.get("category", "General")).strip()[:30]
+        hints = result.get("hints")
+
+        if not word or word in used_words or not isinstance(hints, list) or len(hints) != 4:
+            return None
+
+        clean_hints = [str(hint).strip()[:220] for hint in hints]
+        if any(not hint for hint in clean_hints):
+            return None
+
+        return {"word": word, "category": category or "General", "hints": clean_hints}
+    except Exception as exc:
+        print(f"Gemini question generation failed: {type(exc).__name__}: {exc}")
+        return None
+
+
+async def generate_round_word(room: Room, difficulty: str = "Easy") -> dict[str, Any]:
+    """Try Gemini first, then use an unused built-in word as a fallback."""
+    try:
+        # Do not let a slow/unavailable Gemini response hold up the match.
+        generated = await asyncio.wait_for(
+            asyncio.to_thread(_generate_word_with_gemini, set(room.used_words), difficulty),
+            timeout=8,
+        )
+    except asyncio.TimeoutError:
+        print("Gemini question generation timed out; using an unused fallback question.")
+        generated = None
+
+    if generated:
+        return generated
+
+    fallback_words = [
+        item for item in WORDS
+        if re.sub(r"[^A-Z]", "", item["word"].upper()) not in room.used_words
+    ]
+    if fallback_words:
+        return random.choice(fallback_words)
+
+    raise RuntimeError(
+        "No unused fallback questions remain. Check GEMINI_API_KEY and backend logs."
+    )
 
 
 def safe_name(value: Any) -> str:
@@ -70,10 +187,17 @@ def leaderboard(room: Room) -> list[dict[str, Any]]:
 
 def snapshot(room: Room, recipient_id: str | None = None) -> dict[str, Any]:
     recipient = room.players.get(recipient_id) if recipient_id else None
-    personal_hint_count = (
+    extra_hints_used = (
         recipient.hints_used.get(room.round_number, 0)
         if recipient and room.status == "round"
         else 0
+    )
+    visible_hint_count = min(
+        len(room.current_word["hints"]) if room.current_word else 0,
+        2 + extra_hints_used,
+    ) if room.status == "round" else 0
+    difficulty, question_points = difficulty_for_round(
+        max(1, room.round_number), room.total_rounds
     )
     data = {
         "room_code": room.code,
@@ -83,14 +207,18 @@ def snapshot(room: Room, recipient_id: str | None = None) -> dict[str, Any]:
         "round_number": room.round_number,
         "total_rounds": room.total_rounds,
         "round_duration": room.round_duration,
-        "revealed_hints": personal_hint_count,
+        "revealed_hints": visible_hint_count,
         "hints": (
-            room.current_word["hints"][:personal_hint_count]
+            room.current_word["hints"][:visible_hint_count]
             if room.current_word and room.status == "round"
             else []
         ),
+        "extra_hints_used": extra_hints_used,
+        "free_hints": 2,
+        "difficulty": difficulty,
+        "question_points": question_points,
         "category": room.current_word["category"] if room.current_word else None,
-        "masked_word": " ".join("_" for _ in room.current_word["word"]) if room.current_word else None,
+        "masked_word": "".join("_" for _ in room.current_word["word"]) if room.current_word else None,
         "round_results": room.round_results[-1] if room.round_results else None,
         "chat": room.chat[-30:],
         "rematch_votes": list(room.rematch_votes),
@@ -98,7 +226,15 @@ def snapshot(room: Room, recipient_id: str | None = None) -> dict[str, Any]:
     if room.status == "round" and room.current_word:
         data["round_ends_at"] = room.round_started + room.round_duration
     if room.status == "finished":
-        data["winner"] = leaderboard(room)[0] if room.players else None
+        final_scores = leaderboard(room)
+        top_score = final_scores[0]["score"] if final_scores else 0
+        tied = len(final_scores) > 1 and final_scores[1]["score"] == top_score
+        data["winner"] = (
+            final_scores[0]
+            if final_scores and top_score > 0 and not tied
+            else None
+        )
+        data["is_draw"] = bool(final_scores) and (top_score == 0 or tied)
     return data
 
 async def send_one(player: Player, event: str, payload: Any):
@@ -130,9 +266,22 @@ async def end_round(room: Room):
             "word": word,
             "category": room.current_word["category"] if room.current_word else "",
             "round_winner": None,
+            "difficulty": difficulty_for_round(room.round_number, room.total_rounds)[0],
+            "question_points": difficulty_for_round(room.round_number, room.total_rounds)[1],
             "scores": leaderboard(room),
         })
     await broadcast_state(room)
+    # The server advances the game after a 2-second result break.
+    # This continues even if the host disconnects.
+    asyncio.create_task(auto_advance_round(room, room.round_number))
+
+
+async def auto_advance_round(room: Room, completed_round: int):
+    await asyncio.sleep(2)
+    async with room.lock:
+        if room.status == "round_result" and room.round_number == completed_round:
+            await start_next_round(room)
+
 
 async def run_round_clock(room: Room):
     this_round = room.round_number
@@ -146,10 +295,16 @@ async def start_next_round(room: Room):
     if room.round_number >= room.total_rounds:
         room.status = "finished"
         await broadcast_state(room); return
-    available = [w for w in WORDS if w["word"] not in room.used_words]
-    if not available: room.used_words.clear(); available = WORDS[:]
-    room.current_word = random.choice(available)
-    room.used_words.add(room.current_word["word"])
+    next_round_number = room.round_number + 1
+    difficulty, question_points = difficulty_for_round(next_round_number, room.total_rounds)
+    try:
+        room.current_word = await generate_round_word(room, difficulty)
+    except Exception as exc:
+        print(f"Unable to create next round: {exc}")
+        await broadcast(room, "error", {"message": str(exc)})
+        return
+
+    room.used_words.add(room.current_word["word"].upper())
     room.round_number += 1
     room.revealed_hints = 0  # Compatibility only; hints are tracked per player.
     room.round_started = time.time()
@@ -253,25 +408,31 @@ async def handle_message(room: Room, player: Player, msg: dict[str, Any]):
         # because end_round changes the room status immediately.
         player.guesses.add(room.round_number)
         elapsed = max(0.0, time.time() - room.round_started)
-        hints_used = player.hints_used.get(room.round_number, 0)
-
-        hint_points = max(20, 100 - (hints_used * 20))
-        speed_bonus = max(
-            0,
-            round(20 * (1 - min(elapsed, room.round_duration) / room.round_duration)),
+        extra_hints_used = player.hints_used.get(room.round_number, 0)
+        difficulty, question_points = difficulty_for_round(
+            room.round_number, room.total_rounds
         )
-        earned = hint_points + speed_bonus
+
+        # The question's maximum marks are shown in the UI. Two default
+        # hints are free. Each additional hint reduces available marks by 20%.
+        hint_multiplier = max(0.60, 1 - (extra_hints_used * 0.20))
+        speed_multiplier = 1 - (
+            0.20 * min(elapsed, room.round_duration) / room.round_duration
+        )
+        earned = max(0, round(question_points * hint_multiplier * speed_multiplier))
         player.score += earned
 
         room.round_results.append({
             "round": room.round_number,
             "word": room.current_word["word"],
             "category": room.current_word["category"],
+            "difficulty": difficulty,
+            "question_points": question_points,
             "round_winner": {
                 "id": player.id,
                 "name": player.name,
                 "points": earned,
-                "hints_used": hints_used,
+                "hints_used": extra_hints_used,
                 "time_seconds": round(elapsed, 2),
             },
             "scores": leaderboard(room),
@@ -283,9 +444,11 @@ async def handle_message(room: Room, player: Player, msg: dict[str, Any]):
             {
                 "correct": True,
                 "points": earned,
-                "hints_used": hints_used,
+                "hints_used": extra_hints_used,
+                "difficulty": difficulty,
+                "question_points": question_points,
                 "time_seconds": round(elapsed, 2),
-                "message": f"Correct! You won the round and earned {earned} points.",
+                "message": f"Correct! You earned {earned} out of {question_points} points.",
             },
         )
         await broadcast(
@@ -306,7 +469,7 @@ async def handle_message(room: Room, player: Player, msg: dict[str, Any]):
 
         hints_used = player.hints_used.get(room.round_number, 0)
         total_hints = len(room.current_word["hints"])
-        if hints_used >= total_hints:
+        if (2 + hints_used) >= total_hints:
             await send_one(
                 player,
                 "error",
@@ -324,8 +487,12 @@ async def handle_message(room: Room, player: Player, msg: dict[str, Any]):
             room.chat = room.chat[-60:]
             await broadcast(room,"chat_message",room.chat[-1])
     elif event == "next_round":
-        if player.id != room.host_id: await send_one(player,"error",{"message":"Only the host can continue."}); return
-        if room.status == "round_result": await start_next_round(room)
+        # Round progression is automatic and controlled by the server.
+        await send_one(
+            player,
+            "info",
+            {"message": "The next question will start automatically."},
+        )
     elif event == "rematch_vote":
         room.rematch_votes.add(player.id)
         await broadcast_state(room)
@@ -344,40 +511,223 @@ def health(): return {"status":"healthy","rooms":len(rooms)}
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    room: Room | None = None; player: Player | None = None
+    room: Room | None = None
+    player: Player | None = None
+    player_id = ""
+    waiting_for_match = False
+
     try:
         raw = await websocket.receive_json()
-        action = raw.get("event"); data = raw.get("data") or {}
+        action = raw.get("event")
+        data = raw.get("data") or {}
         player_id = str(data.get("player_id") or f"p_{time.time_ns()}")[:80]
         name = safe_name(data.get("name"))
+
         if action == "create_room":
-            code = new_code(); room = Room(code=code,host_id=player_id); player=Player(player_id,name,websocket); room.players[player_id]=player; rooms[code]=room
+            code = new_code()
+            room = Room(code=code, host_id=player_id)
+            player = Player(player_id, name, websocket)
+            room.players[player_id] = player
+            rooms[code] = room
+
         elif action == "join_room":
-            code = str(data.get("room_code","")).upper().strip(); room=rooms.get(code)
-            if not room: await websocket.send_json({"event":"error","data":{"message":"Room not found. Check the code and try again."}}); await websocket.close(); return
-            if room.status == "finished": room.status = "lobby"
-            existing=room.players.get(player_id)
-            if existing: player=existing; player.name=name; player.websocket=websocket; player.connected=True
+            code = str(data.get("room_code", "")).upper().strip()
+            room = rooms.get(code)
+            if not room:
+                await websocket.send_json({
+                    "event": "error",
+                    "data": {"message": "Room not found. Check the code and try again."},
+                })
+                await websocket.close()
+                return
+
+            if room.status == "finished":
+                room.status = "lobby"
+
+            existing = room.players.get(player_id)
+            if existing:
+                player = existing
+                player.name = name
+                player.websocket = websocket
+                player.connected = True
             else:
-                if len(room.players)>=6: await websocket.send_json({"event":"error","data":{"message":"This room is full (maximum 6 players)."}}); await websocket.close(); return
-                player=Player(player_id,name,websocket); room.players[player_id]=player
+                if len(room.players) >= 2:
+                    await websocket.send_json({
+                        "event": "error",
+                        "data": {"message": "This room is full (maximum 2 players)."},
+                    })
+                    await websocket.close()
+                    return
+                player = Player(player_id, name, websocket)
+                room.players[player_id] = player
+
+        elif action == "quick_match":
+            loop = asyncio.get_running_loop()
+            my_future: asyncio.Future = loop.create_future()
+            waiting_entry = None
+
+            async with matchmaking_lock:
+                # Drop stale waiters before trying to pair.
+                stale_ids = [
+                    pid for pid, entry in matchmaking_waiters.items()
+                    if entry["future"].done()
+                    or entry["websocket"].client_state.name != "CONNECTED"
+                ]
+                for pid in stale_ids:
+                    matchmaking_waiters.pop(pid, None)
+
+                if matchmaking_waiters:
+                    waiting_id, waiting_entry = next(iter(matchmaking_waiters.items()))
+                    matchmaking_waiters.pop(waiting_id, None)
+
+                    waiting_player = Player(
+                        waiting_id,
+                        waiting_entry["name"],
+                        waiting_entry["websocket"],
+                    )
+                    player = Player(player_id, name, websocket)
+                    code = new_code()
+                    room = Room(code=code, host_id=waiting_id, total_rounds=5)
+                    room.players[waiting_id] = waiting_player
+                    room.players[player_id] = player
+                    rooms[code] = room
+
+                    # Notify the waiting player that a match has been found.
+                    if not waiting_entry["future"].done():
+                        waiting_entry["future"].set_result((room, waiting_player))
+
+                else:
+                    # Send the waiting event before exposing this socket in the queue.
+                    # This prevents a late "searching" event arriving after "welcome".
+                    await websocket.send_json({
+                        "event": "matchmaking",
+                        "data": {"status": "searching", "message": "Looking for another player..."},
+                    })
+                    matchmaking_waiters[player_id] = {
+                        "name": name,
+                        "websocket": websocket,
+                        "future": my_future,
+                    }
+                    waiting_for_match = True
+
+            if waiting_for_match:
+                # Exactly one coroutine may call receive_json() on a WebSocket
+                # at a time. Keep one receive task alive while waiting, and
+                # always cancel AND await it before entering the game loop.
+                receive_task = asyncio.create_task(websocket.receive_json())
+                try:
+                    while True:
+                        done, _ = await asyncio.wait(
+                            {my_future, receive_task},
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+
+                        if my_future in done:
+                            receive_task.cancel()
+                            await asyncio.gather(receive_task, return_exceptions=True)
+                            room, player = my_future.result()
+                            break
+
+                        incoming = receive_task.result()
+                        if incoming.get("event") == "cancel_matchmaking":
+                            async with matchmaking_lock:
+                                matchmaking_waiters.pop(player_id, None)
+                            await websocket.send_json({
+                                "event": "matchmaking",
+                                "data": {
+                                    "status": "cancelled",
+                                    "message": "Matchmaking cancelled.",
+                                },
+                            })
+                            await websocket.close()
+                            return
+
+                        # Continue waiting using one new receive task only after
+                        # the previous receive_json() call has completed.
+                        receive_task = asyncio.create_task(websocket.receive_json())
+
+                except WebSocketDisconnect:
+                    async with matchmaking_lock:
+                        matchmaking_waiters.pop(player_id, None)
+                    return
+                finally:
+                    if not receive_task.done():
+                        receive_task.cancel()
+                        await asyncio.gather(receive_task, return_exceptions=True)
+                    async with matchmaking_lock:
+                        entry = matchmaking_waiters.get(player_id)
+                        if entry and entry.get("future") is my_future:
+                            matchmaking_waiters.pop(player_id, None)
+
+                if room is None or player is None:
+                    return
+
+            # The second player to arrive owns the newly created room.
+            # It must welcome BOTH sockets and start the match. The first
+            # player's handler is waiting on my_future and then joins its
+            # normal receive loop below.
+            if action == "quick_match" and not waiting_for_match and room and player and waiting_entry:
+                waiting_player = room.players[room.host_id]
+                await send_one(player, "welcome", {
+                    "player_id": player.id,
+                    "room_code": room.code,
+                    "is_host": player.id == room.host_id,
+                    "match_type": "quick",
+                })
+                await send_one(waiting_player, "welcome", {
+                    "player_id": waiting_player.id,
+                    "room_code": room.code,
+                    "is_host": waiting_player.id == room.host_id,
+                    "match_type": "quick",
+                })
+                await broadcast_state(room)
+                await start_next_round(room)
+
         else:
-            await websocket.send_json({"event":"error","data":{"message":"First create or join a room."}}); await websocket.close(); return
-        await send_one(player,"welcome",{"player_id":player.id,"room_code":room.code,"is_host":player.id==room.host_id})
-        await broadcast_state(room)
-        while True:
-            message=await websocket.receive_json()
-            async with room.lock: await handle_message(room,player,message)
+            await websocket.send_json({
+                "event": "error",
+                "data": {"message": "First create a room, join a room, or choose Quick Match."},
+            })
+            await websocket.close()
+            return
+
+        if room is not None and player is not None and action != "quick_match":
+            await send_one(player, "welcome", {
+                "player_id": player.id,
+                "room_code": room.code,
+                "is_host": player.id == room.host_id,
+            })
+            await broadcast_state(room)
+
+        while room is not None and player is not None:
+            message = await websocket.receive_json()
+            async with room.lock:
+                await handle_message(room, player, message)
+
     except WebSocketDisconnect:
         pass
     except Exception as exc:
-        try: await websocket.send_json({"event":"error","data":{"message":"Connection error. Please reconnect."}})
-        except Exception: pass
+        print(f"WebSocket handler error: {type(exc).__name__}: {exc}")
+        try:
+            await websocket.send_json({
+                "event": "error",
+                "data": {"message": "Connection error. Please reconnect."},
+            })
+        except Exception:
+            pass
     finally:
+        if player_id:
+            async with matchmaking_lock:
+                matchmaking_waiters.pop(player_id, None)
+
         if room and player:
-            player.websocket=None; player.connected=False
-            if room.host_id==player.id:
-                next_host=next((p for p in room.players.values() if p.connected),None)
-                if next_host: room.host_id=next_host.id
+            player.websocket = None
+            player.connected = False
+            if room.host_id == player.id:
+                next_host = next((p for p in room.players.values() if p.connected), None)
+                if next_host:
+                    room.host_id = next_host.id
             await broadcast_state(room)
-            if not any(p.connected for p in room.players.values()): rooms.pop(room.code,None)
+            if not any(p.connected for p in room.players.values()):
+                rooms.pop(room.code, None)
+

@@ -1,16 +1,18 @@
+# Environment variables
+.env
+.env.*
+backend/.env
+frontend/.env
+
 # Python
 venv/
 __pycache__/
 *.pyc
-.env
 
-# Node dependencies
+# Node
 node_modules/
 frontend/node_modules/
-
-# Vite
 frontend/dist/
-frontend/.vite/
 
 # IDE
 .vscode/
