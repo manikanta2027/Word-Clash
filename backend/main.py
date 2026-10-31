@@ -56,6 +56,7 @@ class Room:
     chat: list[dict[str, Any]] = field(default_factory=list)
     rematch_votes: set[str] = field(default_factory=set)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    generation_in_progress: bool = False
 
 
 rooms: dict[str, Room] = {}
@@ -237,6 +238,37 @@ def snapshot(room: Room, recipient_id: str | None = None) -> dict[str, Any]:
         data["is_draw"] = bool(final_scores) and (top_score == 0 or tied)
     return data
 
+async def generate_round_word_from_used(
+    used_words: set[str],
+    difficulty: str
+) -> dict[str, Any]:
+
+    try:
+        generated = await asyncio.wait_for(
+            asyncio.to_thread(
+                _generate_word_with_gemini,
+                used_words,
+                difficulty
+            ),
+            timeout=8
+        )
+    except asyncio.TimeoutError:
+        print("Gemini timed out. Using fallback question.")
+        generated = None
+
+    if generated:
+        return generated
+
+    fallback_words = [
+        item for item in WORDS
+        if item["word"].upper() not in used_words
+    ]
+
+    if fallback_words:
+        return random.choice(fallback_words)
+
+    raise RuntimeError("No unused questions remain.")
+
 async def send_one(player: Player, event: str, payload: Any):
     if player.websocket:
         try: await player.websocket.send_json({"event":event,"data":payload})
@@ -276,11 +308,16 @@ async def end_round(room: Room):
     asyncio.create_task(auto_advance_round(room, room.round_number))
 
 
-async def auto_advance_round(room: Room, completed_round: int):
+async def auto_advance_round(
+    room: Room,
+    completed_round: int
+):
     await asyncio.sleep(2)
-    async with room.lock:
-        if room.status == "round_result" and room.round_number == completed_round:
-            await start_next_round(room)
+
+    await start_next_round(
+        room,
+        expected_completed_round=completed_round
+    )
 
 
 async def run_round_clock(room: Room):
@@ -291,27 +328,82 @@ async def run_round_clock(room: Room):
             await end_round(room); return
         await asyncio.sleep(min(1, remaining))
 
-async def start_next_round(room: Room):
-    if room.round_number >= room.total_rounds:
-        room.status = "finished"
-        await broadcast_state(room); return
-    next_round_number = room.round_number + 1
-    difficulty, question_points = difficulty_for_round(next_round_number, room.total_rounds)
-    try:
-        room.current_word = await generate_round_word(room, difficulty)
-    except Exception as exc:
-        print(f"Unable to create next round: {exc}")
-        await broadcast(room, "error", {"message": str(exc)})
+async def start_next_round(
+    room: Room,
+    expected_completed_round: int | None = None
+):
+    # Phase 1: Reserve the next round under the lock.
+    async with room.lock:
+        if room.generation_in_progress:
+            return
+
+        if expected_completed_round is not None:
+            if (
+                room.status != "round_result"
+                or room.round_number != expected_completed_round
+            ):
+                return
+        elif room.status != "lobby":
+            return
+
+        if room.round_number >= room.total_rounds:
+            room.status = "finished"
+            finished = True
+            previous_round = room.round_number
+        else:
+            finished = False
+            previous_round = room.round_number
+            difficulty, _ = difficulty_for_round(
+                previous_round + 1,
+                room.total_rounds
+            )
+            used_words = set(room.used_words)
+            room.generation_in_progress = True
+
+    if finished:
+        await broadcast_state(room)
         return
 
-    room.used_words.add(room.current_word["word"].upper())
-    room.round_number += 1
-    room.revealed_hints = 0  # Compatibility only; hints are tracked per player.
-    room.round_started = time.time()
-    for player in room.players.values():
-        player.guesses.discard(room.round_number)
-        player.hints_used[room.round_number] = 0
-    room.status = "round"
+    # Phase 2: Generate outside the room lock.
+    try:
+        generated = await generate_round_word_from_used(
+            used_words,
+            difficulty
+        )
+    except Exception as exc:
+        async with room.lock:
+            room.generation_in_progress = False
+
+        print(f"Question generation failed: {exc}")
+        await broadcast(
+            room,
+            "error",
+            {"message": "Could not generate the next question. Please try again."}
+        )
+        return
+
+    # Phase 3: Commit the generated question under the lock.
+    async with room.lock:
+        if (
+            not room.generation_in_progress
+            or room.round_number != previous_round
+        ):
+            return
+
+        room.current_word = generated
+        room.used_words.add(generated["word"].upper())
+        room.round_number += 1
+        room.revealed_hints = 0
+        room.round_started = time.time()
+        room.status = "round"
+
+        for player in room.players.values():
+            player.guesses.discard(room.round_number)
+            player.hints_used[room.round_number] = 0
+
+        room.generation_in_progress = False
+
+    # Phase 4: Notify players and start the clock.
     await broadcast_state(room)
     asyncio.create_task(run_round_clock(room))
 
@@ -486,21 +578,44 @@ async def handle_message(room: Room, player: Player, msg: dict[str, Any]):
             room.chat.append({"id":str(time.time_ns()),"player_id":player.id,"name":player.name,"message":text,"time":time.time()})
             room.chat = room.chat[-60:]
             await broadcast(room,"chat_message",room.chat[-1])
+
     elif event == "next_round":
-        # Round progression is automatic and controlled by the server.
+    # Round progression is automatic and controlled by the server.
         await send_one(
-            player,
-            "info",
-            {"message": "The next question will start automatically."},
-        )
+        player,
+        "info",
+        {"message": "The next question will start automatically."},
+    )
+
     elif event == "rematch_vote":
         room.rematch_votes.add(player.id)
-        await broadcast_state(room)
-        connected = [p for p in room.players.values() if p.connected]
-        if room.status == "finished" and connected and len(room.rematch_votes.intersection(p.id for p in connected)) >= max(2, (len(connected)//2)+1):
-            room.round_number=0; room.used_words.clear(); room.round_results.clear(); room.rematch_votes.clear()
-            for p in room.players.values(): p.score=0; p.guesses.clear(); p.ready=False
-            await start_next_round(room)
+    
+
+    await broadcast_state(room)
+
+    connected = [
+        p for p in room.players.values()
+        if p.connected
+    ]
+
+    if (
+        room.status == "finished"
+        and connected
+        and len(room.rematch_votes.intersection(
+            p.id for p in connected
+        )) >= max(2, (len(connected) // 2) + 1)
+    ):
+        room.round_number = 0
+        room.used_words.clear()
+        room.round_results.clear()
+        room.rematch_votes.clear()
+
+        for p in room.players.values():
+            p.score = 0
+            p.guesses.clear()
+            p.ready = False
+
+        asyncio.create_task(start_next_round(room))
 
 @app.get("/")
 def root(): return {"name":"Word Clash API","status":"ok","docs":"/docs"}

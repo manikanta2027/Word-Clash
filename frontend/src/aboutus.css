@@ -1,0 +1,46 @@
+.about-page { width: 100%; display: flex; flex-direction: column; gap: 28px; }
+.about-hero { padding: clamp(22px, 5vw, 48px); }
+.about-hero h1 { margin: 22px 0 14px; font-size: clamp(2.1rem, 6vw, 4rem); line-height: 1.08; letter-spacing: -0.045em; }
+.about-hero h1 span, .about-section-heading h2 span, .about-bottom h2 span { color: #b783ff; }
+.about-intro { max-width: 760px; color: #aaa3bd; line-height: 1.8; font-size: 1rem; }
+.about-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-top: 30px; }
+.about-stats div { display: flex; flex-direction: column; gap: 7px; padding: 17px; border: 1px solid rgba(167,139,250,.2); border-radius: 14px; background: rgba(167,139,250,.06); }
+.about-stats strong { font-size: clamp(1.5rem, 4vw, 2rem); color: #c49aff; }
+.about-stats span { color: #9189a8; font-size: .68rem; font-weight: 700; letter-spacing: 1px; }
+.about-section-heading { text-align: center; padding-top: 8px; }
+.about-section-heading h2 { margin: 10px 0 0; font-size: clamp(1.7rem, 4vw, 2.5rem); }
+.about-feature-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.about-feature { padding: 24px; }
+.about-feature-icon { display: inline-flex; align-items: center; justify-content: center; width: 46px; height: 46px; border-radius: 13px; color: #c49aff; background: rgba(167,139,250,.13); }
+.about-feature h3 { margin: 17px 0 8px; }
+.about-feature p, .about-bottom p { margin: 0; color: #aaa3bd; line-height: 1.7; }
+.about-bottom { display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 26px; }
+.about-bottom h2 { margin: 10px 0; font-size: clamp(1.35rem, 3vw, 2rem); }
+.about-bottom .primary-btn { flex-shrink: 0; }
+@media (max-width: 640px) {
+  .about-stats { grid-template-columns: 1fr; }
+  .about-stats div { padding: 13px 16px; }
+  .about-feature-grid { grid-template-columns: 1fr; }
+  .about-bottom { align-items: stretch; flex-direction: column; }
+  .about-bottom .primary-btn { width: 100%; justify-content: center; }
+}
+.about-nav-btn, .about-footer-link { border: 0; background: transparent; color: #b9a6e8; cursor: pointer; font: inherit; }
+.about-nav-btn:hover, .about-footer-link:hover { color: #ffffff; }
+.about-footer-link { font-size: .78rem; }
+
+
+
+
+.about-hero {
+    margin-bottom: 40px;
+}
+
+.about-section {
+    margin-top: 40px;
+    padding-top: 10px;
+}
+
+.about-section h2 {
+    margin-top: 20px;
+    margin-bottom: 24px;
+}

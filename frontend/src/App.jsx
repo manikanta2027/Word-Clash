@@ -1,6 +1,6 @@
 
 import React from 'react';
-
+import AboutUs from './Aboutus';
 import {
   useCallback,
   useEffect,
@@ -46,8 +46,13 @@ const savedId = () => {
 
 export default function App() {
   const [screen, setScreen] = useState('home');
-  const [name, setName] = useState('');
-  const [roomCode, setRoomCode] = useState('');
+const [name, setName] = useState(
+  () => sessionStorage.getItem('wc_player_name') || ''
+);
+
+const [roomCode, setRoomCode] = useState(
+  () => sessionStorage.getItem('wc_room_code') || ''
+);
   const [state, setState] = useState(null);
   const [playerId] = useState(savedId);
   const [connected, setConnected] = useState(false);
@@ -69,7 +74,9 @@ export default function App() {
   // Browser back navigation
   const screenRef = useRef(screen);
   const lastHistoryScreen = useRef(screen);
-
+  useEffect(() => {
+  sessionStorage.setItem('wc_player_name', name);
+}, [name]);
   useEffect(() => {
     screenRef.current = screen;
   }, [screen]);
@@ -224,12 +231,18 @@ export default function App() {
       const msg = JSON.parse(e.data);
 
       if (msg.event === 'welcome') {
-        matchedRef.current = true;
-        setConnected(true);
-        setMatchmakingStatus('');
-        setScreen('lobby');
-        setRoomCode(msg.data.room_code);
-      }
+  matchedRef.current = true;
+  setConnected(true);
+  setMatchmakingStatus('');
+
+  const code = msg.data.room_code;
+
+  setRoomCode(code);
+  sessionStorage.setItem('wc_room_code', code);
+  sessionStorage.setItem('wc_player_name', name.trim() || 'Player');
+
+  setScreen('lobby');
+}
 
       else if (msg.event === 'matchmaking') {
         if (msg.data.status === 'cancelled') {
@@ -306,6 +319,21 @@ export default function App() {
       );
     };
   }, [name, playerId, sound]);
+
+  // Automatic reconnection after browser refresh
+const reconnectAttempted = useRef(false);
+
+useEffect(() => {
+  if (reconnectAttempted.current) return;
+
+  const savedRoomCode = sessionStorage.getItem('wc_room_code');
+
+  if (!savedRoomCode) return;
+
+  reconnectAttempted.current = true;
+
+  connect('reconnect', savedRoomCode);
+}, [connect]);
 
   useEffect(() => {
     return () => ws.current?.close();
@@ -449,7 +477,14 @@ export default function App() {
       {/* HEADER */}
 
       <header className="topbar">
+        
 
+        {/* <button
+         className="about-nav-btn"
+         onClick={() => setScreen('about')}
+         >
+         About Us
+        </button> */}
         <button
           className="brand"
           onClick={() =>
@@ -468,7 +503,12 @@ export default function App() {
         </button>
 
         <div className="top-actions">
-
+         <button
+          className="about-nav-btn"
+          onClick={() => setScreen('about')}
+           >
+          About Us
+          </button>
           <span className={`connection ${connected ? 'online' : ''}`}>
             <i />
             {connected ? 'LIVE' : 'OFFLINE'}
@@ -494,7 +534,10 @@ export default function App() {
       </header>
 
       <main className="main-content">
-
+        
+        {screen === 'about' && (
+        <AboutUs onBack={() => setScreen('home')} />
+         )}
         {/* HOME */}
 
         {screen === 'home' && (
